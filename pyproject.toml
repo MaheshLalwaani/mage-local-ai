@@ -1,0 +1,18 @@
+[project]
+name = "magento-local-agent"
+version = "0.1.0"
+description = "Offline-first, approval-gated assistant for Magento repositories"
+requires-python = ">=3.11"
+# Standard library only. Tree-sitter returns as a dependency when symbol
+# extraction actually lands; until then it is an install cost with no importer.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+magento-agent = "magento_local_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
