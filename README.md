@@ -13,6 +13,7 @@ applies a change to Magento.
 - Assess a requirement as `USE_CORE`, `EXTEND_EXISTING`,
   `NEW_CUSTOMIZATION`, or `INSUFFICIENT_EVIDENCE`.
 - Explain the structure and tests of a custom `Vendor_Module`.
+- Review an allowlisted PHP file for evidence-backed Magento code issues.
 - Produce a PHPUnit 9.5 test plan without creating files.
 - Optionally propose an evidence-based unified diff with `assess --include-code`.
 - Run a small, approval-gated set of read-only Magento commands.
@@ -104,6 +105,25 @@ magento-agent --model qwen2.5-coder:14b assess \
   --include-code
 ```
 
+### Slow-machine and timeout fallback
+
+If the default `qwen2.5-coder:7b` is slow to start, times out, or makes the
+machine unresponsive, use a smaller model. Keep streaming enabled (the default)
+so Ollama can return tokens while it works; do **not** add `--no-stream` for a
+long test-generation request.
+
+```bash
+# First choice for lower-memory or CPU-only machines.
+ollama pull qwen2.5-coder:3b
+magento-agent --model qwen2.5-coder:3b assess \
+  /path/to/magento "Explain the product import validation flow"
+
+# Fastest fallback; expect lower-quality Magento reasoning and tests.
+ollama pull qwen2.5-coder:1.5b
+magento-agent --model qwen2.5-coder:1.5b assess \
+  /path/to/magento "Explain the product import validation flow"
+```
+
 The Qwen 2.5 Coder family provides 0.5B, 1.5B, 3B, 7B, 14B, and 32B variants;
 its Ollama page lists the current download sizes and tags. Qwen3-Coder offers a
 30B local variant as well. Check the [Qwen2.5-Coder library page](https://ollama.com/library/qwen2.5-coder)
@@ -117,11 +137,26 @@ choosing a model, as available tags and sizes can change.
 magento-agent ask /path/to/magento \
   "Where is the product import validation implemented?"
 
+# Review one PHP source file. It reports findings only and makes no changes.
+magento-agent review /path/to/magento \
+  app/code/Vendor/Module/Model/ImportValidator.php
+
+# Add an evidence-based proposed diff for the reviewed file; it is never applied.
+magento-agent review /path/to/magento \
+  app/code/Vendor/Module/Model/ImportValidator.php \
+  --include-code
+
 # Inventory a custom module without calling a model.
 magento-agent explain /path/to/magento Vendor_Module
 
 # Ask for a test plan; this does not create test files.
 magento-agent tests /path/to/magento Vendor_Module
+
+# Generate and write one PHPUnit 9.5 test file from the selected class source.
+# This creates or replaces only the calculated Test/Unit/...Test.php path.
+magento-agent tests /path/to/magento Vendor_Module \
+  --target Model/Foo.php \
+  --include-code --write --approve RUN
 
 # Display a proposed read-only command. Add --approve RUN to execute it.
 magento-agent command /path/to/magento module-status
@@ -132,6 +167,48 @@ The command allowlist is `module-status`, `cache-status`, and `php-lint
 <relative.php file>`. The exact command is shown first and requires
 `--approve RUN` to execute. Docker Compose projects can use `--runner docker
 --service phpfpm`.
+
+### Code review
+
+`review <relative.php file>` reads one allowlisted PHP source file directly and
+sends its line-numbered contents to the local model. It returns only findings
+that the supplied file supports, covering correctness, Magento conventions,
+dependency injection, error handling, performance, security, and testability.
+Every finding should include severity, exact line numbers, evidence, risk, and
+a recommendation. Pass `--include-code` to request a unified diff for that
+file only; the diff is printed for review and is never applied.
+
+### Test generation
+
+`tests` without flags creates a test plan from the module inventory. Add
+`--include-code --target <path>` to generate a complete proposed PHPUnit 9.5
+unit-test file for one custom-module PHP class. The target path is relative to
+the module, for example `Model/ImportValidator.php`; it must not point inside
+`Test/`. The source is supplied to the local model as evidence, so this mode is
+more useful than a file-name-only test plan.
+
+Add `--write --approve RUN` to create the calculated `Test/Unit/...Test.php`
+file, or replace it if it already exists. The tool accepts only one complete
+fenced PHP test class and refuses ambiguous or malformed output; it never
+writes another path. While writing, it shows a progress message and dots rather
+than printing the generated PHP. Generated test classes must include a PHPDoc
+class docblock and a meaningful PHPDoc block on every `test...` method,
+including an `@covers` target and `@return void`. PHPDoc is a generation
+guideline rather than a write-blocking requirement, so review the resulting
+diff before committing. The tool does not run PHPUnit or claim coverage; those
+will be separate, approval-gated steps.
+
+For example, this command generates a test with the smaller 3B model and
+creates or replaces `app/code/Vendor/Module/Test/Unit/Model/FooTest.php`:
+
+```bash
+magento-agent --model qwen2.5-coder:3b tests /path/to/magento Vendor_Module \
+  --target Model/Foo.php \
+  --include-code --write --approve RUN
+```
+
+While writing, the terminal displays a progress message and dots rather than
+the generated PHP. It reports the exact path after the file is written.
 
 ## Security and data handling
 

@@ -19,6 +19,11 @@ OLLAMA_CHAT = "http://127.0.0.1:11434/api/chat"
 CHUNK_LINES = 40
 MODEL_CONTEXT = 8192
 MODEL_PREDICT = 512
+# A complete PHPUnit class needs more output than an advisory answer. Keep the
+# source cap below the context window so Ollama still has room to write it.
+TEST_CODE_PREDICT = 2400
+TEST_SOURCE_CHARS = 14_000
+REVIEW_SOURCE_CHARS = 18_000
 # Applies per socket read, so under streaming it means "no token for this long"
 # rather than a budget for the whole answer.
 MODEL_TIMEOUT = 300
@@ -336,18 +341,19 @@ def retrieve(repo: Path, query_text: str, db: sqlite3.Connection, limit: int = 5
     return picked
 
 
-def model_reply(model: str, system: str, prompt: str, stream: bool = True) -> str:
+def model_reply(model: str, system: str, prompt: str, stream: bool = True, predict: int = MODEL_PREDICT, show_stream: bool = True) -> str:
     """Call Ollama. When streaming, tokens are printed as they arrive and also
     returned, so a slow local model looks slow instead of looking hung."""
     payload = json.dumps({"model": model, "stream": stream, "messages": [
         {"role": "system", "content": system}, {"role": "user", "content": prompt},
-    ], "options": {"num_ctx": MODEL_CONTEXT, "num_predict": MODEL_PREDICT}}).encode()
+    ], "options": {"num_ctx": MODEL_CONTEXT, "num_predict": predict}}).encode()
     request = urllib.request.Request(OLLAMA_CHAT, data=payload, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=MODEL_TIMEOUT) as response:
             if not stream:
                 return json.loads(response.read())["message"]["content"]
             parts: list[str] = []
+            hidden_pieces = 0
             for line in response:
                 if not line.strip():
                     continue
@@ -356,11 +362,17 @@ def model_reply(model: str, system: str, prompt: str, stream: bool = True) -> st
                     raise RuntimeError(f"Ollama reported an error: {message['error']}")
                 piece = message.get("message", {}).get("content", "")
                 if piece:
-                    print(piece, end="", flush=True)
+                    if show_stream:
+                        print(piece, end="", flush=True)
+                    else:
+                        hidden_pieces += 1
+                        if hidden_pieces % 25 == 0:
+                            print(".", end="", flush=True)
                     parts.append(piece)
                 if message.get("done"):
                     break
-            print()
+            if show_stream or hidden_pieces:
+                print()
             return "".join(parts)
     except TimeoutError:
         raise RuntimeError(f"No response from Ollama within {MODEL_TIMEOUT}s. The model may be loading, or {model} may be too large for this machine; try a smaller model with --model.") from None
@@ -404,6 +416,32 @@ Never claim a feature exists without an evidence path. {code_instruction}"""
     return model_reply(model, system, prompt, stream)
 
 
+def review(repo: Path, target: str, model: str, db: sqlite3.Connection, audit_prompts: bool, stream: bool = True, include_code: bool = False) -> str:
+    """Review one allowlisted PHP source file without writing to the checkout."""
+    relative = Path(target)
+    if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".php":
+        raise ValueError("review needs a safe relative .php path")
+    path = repo / relative
+    if not allowed(repo, path):
+        raise ValueError("review target must be an allowlisted PHP source file")
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise ValueError(f"Cannot read review target: {target}") from None
+    if len(source) > REVIEW_SOURCE_CHARS:
+        raise ValueError(f"Review target exceeds {REVIEW_SOURCE_CHARS} characters; review a smaller class or split it first")
+    numbered = "\n".join(f"{number:4}: {line}" for number, line in enumerate(source.splitlines(), 1))
+    audit(db, "review", json.dumps({"repo": str(repo), "target": target, "prompt": target if audit_prompts else "[not stored]"}))
+    code_instruction = """The user requested a fix proposal. End with PROPOSED PATCH as a unified diff for this file only. Do not claim it was applied.""" if include_code else "Do not write a patch or execute code."
+    system = f"""You are a conservative Magento 2 PHP code reviewer. Use only the supplied file.
+Review correctness, Magento conventions, dependency injection, error handling, performance,
+security, and testability. Do not invent surrounding code, configuration, or runtime results.
+Return concise sections: Summary, Findings, Test gaps, Recommendation. Each finding must
+include severity (critical/high/medium/low), exact line number(s), evidence, risk, and a
+specific recommendation. If there are no supported findings, say so. {code_instruction}"""
+    return model_reply(model, system, f"File: {relative.as_posix()}\n\nPHP source with line numbers:\n```php\n{numbered}\n```", stream, TEST_CODE_PREDICT if include_code else MODEL_PREDICT)
+
+
 def module_overview(repo: Path, module: str, db: sqlite3.Connection) -> str:
     vendor_module = module.split("_")
     if len(vendor_module) != 2 or not all(vendor_module):
@@ -418,12 +456,85 @@ def module_overview(repo: Path, module: str, db: sqlite3.Connection) -> str:
     return "\n".join([f"Module: {module}", f"Files: {len(files)}", f"Configuration files: {len(configs)}", f"Existing tests: {len(tests)}", "", "Configuration:", *(configs[:30] or ["(none found)"]), "", "Tests:", *(tests[:30] or ["(none found)"])])
 
 
-def test_plan(repo: Path, module: str, model: str, db: sqlite3.Connection, stream: bool = True) -> str:
+def test_target(repo: Path, module_directory: Path, target: str) -> tuple[Path, str]:
+    """Resolve one safe, custom-module PHP class for test generation."""
+    relative = Path(target)
+    if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".php":
+        raise ValueError("--target must be a safe .php path relative to the custom module")
+    path = module_directory / relative
+    try:
+        path.resolve().relative_to(module_directory.resolve())
+    except ValueError:
+        raise ValueError("--target must stay inside the custom module") from None
+    if "/Test/" in path.as_posix() or not allowed(repo, path):
+        raise ValueError("--target must be an allowlisted, non-test PHP source file")
+    return path, path.relative_to(repo).as_posix()
+
+
+def proposed_test_path(module_directory: Path, target_path: Path) -> Path:
+    """Map Model/Foo.php to Test/Unit/Model/FooTest.php inside one module."""
+    module_relative = target_path.relative_to(module_directory)
+    return (module_directory / "Test/Unit" / module_relative).with_name(module_relative.stem + "Test.php")
+
+
+def extract_test_file(answer: str) -> str:
+    """Accept one complete fenced PHP file and reject ambiguous model output."""
+    blocks = re.findall(r"```(?:php)?\s*\n(.*?)```", answer, flags=re.IGNORECASE | re.DOTALL)
+    if len(blocks) != 1:
+        raise ValueError("Generated response must contain exactly one fenced PHP block; no test file was written")
+    code = blocks[0].strip() + "\n"
+    if not code.startswith("<?php"):
+        raise ValueError("Generated PHP block is missing the <?php opening tag; no test file was written")
+    if not re.search(r"\bclass\s+\w+Test\b", code) or not re.search(r"\bextends\s+(?:\\?PHPUnit\\Framework\\)?TestCase\b", code):
+        raise ValueError("Generated PHP block does not look like a complete PHPUnit test class; no test file was written")
+    return code
+
+
+def write_test_file(repo: Path, module_directory: Path, target: str, answer: str, db: sqlite3.Connection) -> Path:
+    """Write only the calculated Unit-test path after the caller's explicit approval."""
+    target_path, _ = test_target(repo, module_directory, target)
+    destination = proposed_test_path(module_directory, target_path)
+    code = extract_test_file(answer)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(code, encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"Could not write generated test file: {error}") from None
+    audit(db, "test_written", f"repo={repo}; target={target_path.relative_to(repo)}; test={destination.relative_to(repo)}")
+    return destination
+
+
+def test_plan(repo: Path, module: str, model: str, db: sqlite3.Connection, stream: bool = True, target: str | None = None, include_code: bool = False, show_stream: bool = True) -> str:
     overview = module_overview(repo, module, db)
     vendor_module = module.split("_")
     directory = repo / "app/code" / vendor_module[0] / vendor_module[1]
     candidates = [path.relative_to(repo).as_posix() for path in directory.rglob("*.php") if "/Test/" not in path.as_posix()][:20]
     audit(db, "tests", f"repo={repo}; module={module}")
+    if include_code:
+        if not target:
+            raise ValueError("--include-code needs --target, for example --target Model/Foo.php")
+        target_path, target_rel = test_target(repo, directory, target)
+        try:
+            source = target_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise ValueError(f"Cannot read target source file: {target}") from None
+        if len(source) > TEST_SOURCE_CHARS:
+            raise ValueError(f"Target source exceeds {TEST_SOURCE_CHARS} characters; select a smaller class or split it before generating a focused unit test")
+        test_rel = proposed_test_path(directory, target_path).relative_to(repo).as_posix()
+        system = """You are a Magento 2 PHPUnit 9.5 test author. Write one complete,
+isolated unit-test class for the supplied PHP class. Use only class names, constructor
+dependencies, methods, and behaviour visible in the supplied source. Mock constructor
+dependencies; do not use ObjectManager, a database, Magento bootstrap, or integration
+fixtures. Do not invent production classes, methods, or configuration.
+Name every test method with a `test...` prefix. Add an accurate PHPDoc block to the
+test class and every test method. Include an `@covers` tag for the supplied target
+class and concise `@return void` tags on test methods; describe the behaviour under
+test rather than repeating the method name.
+Return exactly: Target class, Test file path, Assumptions, then one fenced `php` block
+containing the complete proposed test file. This is a proposal only: never claim it was
+written, executed, passing, or sufficient for a coverage percentage."""
+        prompt = f"Module overview:\n{overview}\n\nTarget source path: {target_rel}\nProposed test path: {test_rel}\n\nTarget PHP source:\n```php\n{source}\n```"
+        return model_reply(model, system, prompt, stream, TEST_CODE_PREDICT, show_stream)
     system = """You are a Magento 2 PHPUnit test planner. Do not write files. Create a PHPUnit 9.5 unit-test plan.
 Prefer isolated tests with mocks for constructor dependencies; identify integration-only behavior separately.
 Return: Target class, Test cases, Mocks, Test file path, Why. Do not invent classes outside the candidate list."""
@@ -470,13 +581,19 @@ def run() -> None:
     parser.add_argument("--audit-prompts", action="store_true")
     parser.add_argument("--no-stream", action="store_true", help="Buffer the whole answer instead of printing tokens as they arrive")
     sub = parser.add_subparsers(dest="action", required=True)
-    for action in ("index", "index-core", "ask", "assess", "explain", "tests", "command"):
+    for action in ("index", "index-core", "ask", "assess", "review", "explain", "tests", "command"):
         p = sub.add_parser(action); p.add_argument("repo", type=Path)
     sub.choices["ask"].add_argument("question")
     sub.choices["assess"].add_argument("requirement")
     sub.choices["assess"].add_argument("--include-code", action="store_true", help="Include an evidence-based proposed patch; never applies changes")
+    sub.choices["review"].add_argument("target", help="Allowlisted PHP path relative to the Magento checkout")
+    sub.choices["review"].add_argument("--include-code", action="store_true", help="Include a proposed unified diff for the reviewed file; never applies changes")
     sub.choices["explain"].add_argument("module")
     sub.choices["tests"].add_argument("module")
+    sub.choices["tests"].add_argument("--target", help="PHP path relative to the custom module, required with --include-code")
+    sub.choices["tests"].add_argument("--include-code", action="store_true", help="Generate a proposed PHPUnit test file for --target; never writes it")
+    sub.choices["tests"].add_argument("--write", action="store_true", help="Write the generated test to its calculated Test/Unit path; requires --approve RUN")
+    sub.choices["tests"].add_argument("--approve", metavar="TOKEN", help="Required token for --write; use RUN after reviewing the target")
     p = sub.choices["command"]
     p.add_argument("name", choices=["module-status", "cache-status", "php-lint"])
     p.add_argument("argument", nargs="?")
@@ -488,14 +605,29 @@ def run() -> None:
         files, chunks = index(repo, db); print(f"Indexed {files} files into {chunks} chunks; sensitive/non-allowlisted paths were skipped."); return
     if args.action == "index-core":
         modules, records, disabled = index_core(repo, db); print(f"Indexed {records} core capabilities from {modules} modules under {CORE_VENDOR}/ (declarations only); {disabled} of those modules are disabled in this install."); return
-    if args.action in ("ask", "assess", "tests"):
+    if args.action in ("ask", "assess", "review", "tests"):
         # model_reply already printed the answer when streaming.
         if args.action == "ask":
             answer = ask(repo, args.question, args.model, db, args.audit_prompts, stream)
         elif args.action == "assess":
             answer = assess(repo, args.requirement, args.model, db, args.audit_prompts, stream, args.include_code)
+        elif args.action == "review":
+            answer = review(repo, args.target, args.model, db, args.audit_prompts, stream, args.include_code)
         else:
-            answer = test_plan(repo, args.module, args.model, db, stream)
+            if args.write and not args.include_code:
+                raise ValueError("--write requires --include-code")
+            if args.write and args.approve != "RUN":
+                raise ValueError("--write requires --approve RUN")
+            if args.write and not stream:
+                raise ValueError("--write uses streaming to avoid timeouts; remove --no-stream")
+            if args.write:
+                print(f"Generating a PHPUnit test for {args.target}; waiting for the local model", end="", flush=True)
+            answer = test_plan(repo, args.module, args.model, db, stream, args.target, args.include_code, not args.write)
+            if args.write:
+                print("Validating generated PHP and writing the test file...")
+                directory = repo / "app/code" / args.module.split("_")[0] / args.module.split("_")[1]
+                destination = write_test_file(repo, directory, args.target, answer, db)
+                print(f"Wrote generated test file: {destination}")
         if not stream:
             print(answer)
         return
