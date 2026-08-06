@@ -51,9 +51,14 @@ ollama pull qwen2.5-coder:7b
 Confirm that the tool is available:
 
 ```bash
-magento-agent --help
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli --help
 ollama list
 ```
+
+The examples below use `PYTHONPATH=src .venv/bin/python -m
+magento_local_agent.cli` rather than the optional `magento-agent` console
+script. Run them from this repository root; this form works even when the
+console-script entry point is not on your shell `PATH`.
 
 ## First use
 
@@ -61,17 +66,17 @@ Replace `/path/to/magento` with the absolute path to your Magento checkout.
 
 ```bash
 # Index only allowlisted project files.
-magento-agent index /path/to/magento
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli index /path/to/magento
 
 # Optional: index Magento core declarations. This enables USE_CORE decisions.
-magento-agent index-core /path/to/magento
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli index-core /path/to/magento
 
 # Assess a requirement using the default model.
-magento-agent assess /path/to/magento \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli assess /path/to/magento \
   "Add a customer field during checkout"
 
 # Request a reviewable proposal. This never writes or applies the patch.
-magento-agent assess /path/to/magento \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli assess /path/to/magento \
   "Add a customer field during checkout" \
   --include-code
 ```
@@ -99,7 +104,7 @@ not guarantees; leave several GB free for the OS and Magento/Docker.
 Use a downloaded model with `--model`:
 
 ```bash
-magento-agent --model qwen2.5-coder:14b assess \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli --model qwen2.5-coder:14b assess \
   /path/to/magento \
   "Add an admin configuration field for the import limit" \
   --include-code
@@ -115,12 +120,12 @@ long test-generation request.
 ```bash
 # First choice for lower-memory or CPU-only machines.
 ollama pull qwen2.5-coder:3b
-magento-agent --model qwen2.5-coder:3b assess \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli --model qwen2.5-coder:3b assess \
   /path/to/magento "Explain the product import validation flow"
 
 # Fastest fallback; expect lower-quality Magento reasoning and tests.
 ollama pull qwen2.5-coder:1.5b
-magento-agent --model qwen2.5-coder:1.5b assess \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli --model qwen2.5-coder:1.5b assess \
   /path/to/magento "Explain the product import validation flow"
 ```
 
@@ -134,33 +139,33 @@ choosing a model, as available tags and sizes can change.
 
 ```bash
 # Ask a question using indexed project code.
-magento-agent ask /path/to/magento \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli ask /path/to/magento \
   "Where is the product import validation implemented?"
 
 # Review one PHP source file. It reports findings only and makes no changes.
-magento-agent review /path/to/magento \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli review /path/to/magento \
   app/code/Vendor/Module/Model/ImportValidator.php
 
 # Add an evidence-based proposed diff for the reviewed file; it is never applied.
-magento-agent review /path/to/magento \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli review /path/to/magento \
   app/code/Vendor/Module/Model/ImportValidator.php \
   --include-code
 
 # Inventory a custom module without calling a model.
-magento-agent explain /path/to/magento Vendor_Module
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli explain /path/to/magento Vendor_Module
 
 # Ask for a test plan; this does not create test files.
-magento-agent tests /path/to/magento Vendor_Module
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli tests /path/to/magento Vendor_Module
 
 # Generate and write one PHPUnit 9.5 test file from the selected class source.
 # This creates or replaces only the calculated Test/Unit/...Test.php path.
-magento-agent tests /path/to/magento Vendor_Module \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli tests /path/to/magento Vendor_Module \
   --target Model/Foo.php \
   --include-code --write --approve RUN
 
 # Display a proposed read-only command. Add --approve RUN to execute it.
-magento-agent command /path/to/magento module-status
-magento-agent command /path/to/magento php-lint app/code/Vendor/Module/Model/Foo.php
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli command /path/to/magento module-status
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli command /path/to/magento php-lint app/code/Vendor/Module/Model/Foo.php
 ```
 
 The command allowlist is `module-status`, `cache-status`, and `php-lint
@@ -202,7 +207,7 @@ For example, this command generates a test with the smaller 3B model and
 creates or replaces `app/code/Vendor/Module/Test/Unit/Model/FooTest.php`:
 
 ```bash
-magento-agent --model qwen2.5-coder:3b tests /path/to/magento Vendor_Module \
+PYTHONPATH=src .venv/bin/python -m magento_local_agent.cli --model qwen2.5-coder:3b tests /path/to/magento Vendor_Module \
   --target Model/Foo.php \
   --include-code --write --approve RUN
 ```
